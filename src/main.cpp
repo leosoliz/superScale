@@ -1,14 +1,13 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
-#include <AsyncTCP.h>
-#include <DNSServer.h>
-#include <ESPAsyncWebServer.h>
-#include <ESPAsync_WiFiManager.h>
 #include <HX711.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_system.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
 #include <cmath>
 
@@ -35,14 +34,17 @@ constexpr char HOSTNAME[] = "esp32-glp-scale";
 constexpr char AP_NAME[] = "GLP-Scale-Setup";
 constexpr char AP_PASSWORD[] = "glp12345";
 constexpr char MQTT_TOPIC_PREFIX[] = "glp/scale";
+constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000;
 }  // namespace Defaults
 
 struct DeviceConfig {
+  char wifiSsid[32] = "";
+  char wifiPassword[64] = "";
   char mqttHost[64] = "";
   uint16_t mqttPort = 8883;
   char mqttUser[32] = "";
   char mqttPassword[32] = "";
-  char mqttTopic[96] = Defaults::MQTT_TOPIC_PREFIX;
+  char mqttTopic[96] = "glp/scale";
   char deviceId[32] = "balanca-glp-01";
   float scaleFactor = Defaults::SCALE_FACTOR;
   long hxOffset = 0;
@@ -68,9 +70,7 @@ struct Measurements {
 
 Preferences preferences;
 HX711 scale;
-AsyncWebServer server(Defaults::HTTP_PORT);
-DNSServer dnsServer;
-ESPAsync_WiFiManager wifiManager(&server, &dnsServer, Defaults::HOSTNAME);
+AsyncWebServer* server = nullptr;
 WiFiClient wifiClient;
 WiFiClientSecure wifiClientSecure;
 PubSubClient mqttClient;
@@ -78,6 +78,39 @@ DeviceConfig config;
 Measurements current;
 uint32_t lastReadMs = 0;
 uint32_t lastMqttMs = 0;
+
+const char* resetReasonName(esp_reset_reason_t reason) {
+  switch (reason) {
+    case ESP_RST_UNKNOWN: return "unknown";
+    case ESP_RST_POWERON: return "power_on";
+    case ESP_RST_EXT: return "external_pin";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "panic";
+    case ESP_RST_INT_WDT: return "interrupt_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";
+    case ESP_RST_WDT: return "other_wdt";
+    case ESP_RST_DEEPSLEEP: return "deep_sleep";
+    case ESP_RST_BROWNOUT: return "brownout";
+    case ESP_RST_SDIO: return "sdio";
+    default: return "unmapped";
+  }
+}
+
+void logBootInfo() {
+  const esp_reset_reason_t reason = esp_reset_reason();
+  Serial.println();
+  Serial.printf("Reset reason: %s (%d)\n", resetReasonName(reason), static_cast<int>(reason));
+  Serial.printf("Free heap at boot: %u bytes\n", ESP.getFreeHeap());
+}
+
+void logBootStep(const __FlashStringHelper* step) {
+#ifdef BOOT_DIAGNOSTICS
+  Serial.print(F("[boot] "));
+  Serial.println(step);
+#else
+  (void)step;
+#endif
+}
 
 String htmlEscape(const String& input) {
   String out;
@@ -195,6 +228,8 @@ String buildPage() {
   page += F("<p class='note'>OTA permanece disponível via ArduinoOTA após a conexão na rede local.</p></div>");
 
   page += F("<div class='card'><h2>Parâmetros</h2><form method='POST' action='/config'>");
+  page += "<label>Wi-Fi SSID</label><input name='wifiSsid' value='" + htmlEscape(String(config.wifiSsid)) + "'>";
+  page += "<label>Wi-Fi senha</label><input name='wifiPassword' type='password' value='" + htmlEscape(String(config.wifiPassword)) + "'>";
   page += "<label>Device ID</label><input name='deviceId' value='" + htmlEscape(String(config.deviceId)) + "'>";
   page += "<label>MQTT host</label><input name='mqttHost' value='" + htmlEscape(String(config.mqttHost)) + "'>";
   page += "<label>MQTT port</label><input name='mqttPort' value='" + String(config.mqttPort) + "'>";
@@ -235,13 +270,16 @@ void applyPostedConfig(AsyncWebServerRequest* request) {
     }
   };
 
+  copyField("wifiSsid", config.wifiSsid, sizeof(config.wifiSsid));
+  copyField("wifiPassword", config.wifiPassword, sizeof(config.wifiPassword));
   copyField("deviceId", config.deviceId, sizeof(config.deviceId));
   copyField("mqttHost", config.mqttHost, sizeof(config.mqttHost));
   copyField("mqttUser", config.mqttUser, sizeof(config.mqttUser));
   copyField("mqttPassword", config.mqttPassword, sizeof(config.mqttPassword));
   copyField("mqttTopic", config.mqttTopic, sizeof(config.mqttTopic));
 
-  config.mqttPort = max(1, requestValue(request, "mqttPort").toInt());
+  const long postedMqttPort = requestValue(request, "mqttPort").toInt();
+  config.mqttPort = static_cast<uint16_t>(constrain(postedMqttPort, 1L, 65535L));
   config.mqttTls = requestValue(request, "mqttTls") != "0";
   config.scaleFactor = requestValue(request, "scaleFactor").toFloat();
   config.tareKg = requestValue(request, "tareKg").toFloat();
@@ -257,24 +295,23 @@ void applyPostedConfig(AsyncWebServerRequest* request) {
   scale.set_offset(config.hxOffset);
   mqttClient.setServer(config.mqttHost, config.mqttPort);
 }
-
 void configureServer() {
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+  server->on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
     updateMeasurements();
     request->send(200, "text/html; charset=utf-8", buildPage());
   });
 
-  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+  server->on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
     updateMeasurements();
     request->send(200, "application/json", buildJson());
   });
 
-  server.on("/config", HTTP_POST, [](AsyncWebServerRequest* request) {
+  server->on("/config", HTTP_POST, [](AsyncWebServerRequest* request) {
     applyPostedConfig(request);
     redirectToRoot(request);
   });
 
-  server.on("/tare", HTTP_POST, [](AsyncWebServerRequest* request) {
+  server->on("/tare", HTTP_POST, [](AsyncWebServerRequest* request) {
     updateMeasurements();
     if (current.valid) {
       config.tareKg = current.grossKg;
@@ -283,7 +320,7 @@ void configureServer() {
     redirectToRoot(request);
   });
 
-  server.on("/zero", HTTP_POST, [](AsyncWebServerRequest* request) {
+  server->on("/zero", HTTP_POST, [](AsyncWebServerRequest* request) {
     if (scale.wait_ready_timeout(3000)) {
       config.hxOffset = scale.read_average(20);
       scale.set_offset(config.hxOffset);
@@ -292,26 +329,48 @@ void configureServer() {
     redirectToRoot(request);
   });
 
-  server.on("/restart", HTTP_POST, [](AsyncWebServerRequest* request) {
+  server->on("/restart", HTTP_POST, [](AsyncWebServerRequest* request) {
     request->send(200, "text/plain", "Reiniciando...");
     delay(250);
     ESP.restart();
   });
 
-  server.onNotFound([](AsyncWebServerRequest* request) {
+  server->onNotFound([](AsyncWebServerRequest* request) {
     request->send(404, "application/json", "{\"error\":\"not_found\"}");
   });
 
   DefaultHeaders::Instance().addHeader("Cache-Control", "no-store");
-  server.begin();
+  server->begin();
 }
 
 void setupWifi() {
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setHostname(Defaults::HOSTNAME);
-  wifiManager.setConfigPortalTimeout(180);
-  if (!wifiManager.autoConnect(Defaults::AP_NAME, Defaults::AP_PASSWORD)) {
-    ESP.restart();
+  Serial.printf("Connecting Wi-Fi as '%s'...\n", Defaults::HOSTNAME);
+
+  bool connected = false;
+  if (strlen(config.wifiSsid) > 0) {
+    WiFi.begin(config.wifiSsid, config.wifiPassword);
+    const uint32_t startMs = millis();
+    while (millis() - startMs < Defaults::WIFI_CONNECT_TIMEOUT_MS) {
+      if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+        break;
+      }
+      delay(250);
+      Serial.print('.');
+    }
+    Serial.println();
+  }
+
+  if (connected) {
+    Serial.printf("Wi-Fi connected: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    WiFi.disconnect(true, true);
+    WiFi.softAP(Defaults::AP_NAME, Defaults::AP_PASSWORD);
+    Serial.printf("Wi-Fi unavailable; AP fallback started: %s @ %s\n",
+                  Defaults::AP_NAME,
+                  WiFi.softAPIP().toString().c_str());
   }
 }
 
@@ -371,14 +430,28 @@ void setupScale() {
 
 void setup() {
   Serial.begin(115200);
+  delay(200);
+  logBootInfo();
+  logBootStep(F("setup begin"));
+  logBootStep(F("allocating async services"));
+  server = new AsyncWebServer(Defaults::HTTP_PORT);
+  logBootStep(F("analogReadResolution"));
   analogReadResolution(12);
+  logBootStep(F("loadConfig"));
   loadConfig();
+  logBootStep(F("setupScale"));
   setupScale();
+  logBootStep(F("setupWifi"));
   setupWifi();
+  logBootStep(F("configureServer"));
   configureServer();
+  logBootStep(F("setupMqtt"));
   setupMqtt();
+  logBootStep(F("setupOta"));
   setupOta();
+  logBootStep(F("updateMeasurements"));
   updateMeasurements();
+  logBootStep(F("setup complete"));
 }
 
 void loop() {
