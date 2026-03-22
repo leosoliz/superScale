@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
 #include <AsyncTCP.h>
-#include <ESPAsyncDNSServer.h>
+#include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
 #include <ESPAsync_WiFiManager.h>
 #include <HX711.h>
@@ -69,7 +69,7 @@ struct Measurements {
 Preferences preferences;
 HX711 scale;
 AsyncWebServer server(Defaults::HTTP_PORT);
-AsyncDNSServer dnsServer;
+DNSServer dnsServer;
 ESPAsync_WiFiManager wifiManager(&server, &dnsServer, Defaults::HOSTNAME);
 WiFiClient wifiClient;
 WiFiClientSecure wifiClientSecure;
