@@ -1,13 +1,14 @@
 #include <Arduino.h>
 #include <ArduinoOTA.h>
-#include <DNSServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncDNSServer.h>
+#include <ESPAsyncWebServer.h>
+#include <ESPAsync_WiFiManager.h>
 #include <HX711.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
-#include <WebServerSecure.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <WiFiManager.h>
 
 #include <cmath>
 
@@ -29,7 +30,7 @@ constexpr float BETA_COEFFICIENT = 3950.0f;
 constexpr uint16_t ADC_MAX = 4095;
 constexpr uint32_t READ_INTERVAL_MS = 2000;
 constexpr uint32_t MQTT_INTERVAL_MS = 10000;
-constexpr uint16_t HTTPS_PORT = 443;
+constexpr uint16_t HTTP_PORT = 80;
 constexpr char HOSTNAME[] = "esp32-glp-scale";
 constexpr char AP_NAME[] = "GLP-Scale-Setup";
 constexpr char AP_PASSWORD[] = "glp12345";
@@ -61,74 +62,22 @@ struct Measurements {
   float netGlpKg = 0.0f;
   float levelPct = 0.0f;
   float estimatedLiters = 0.0f;
-  float temperatureC = 0.0f;
+  float temperatureC = NAN;
   bool valid = false;
 };
 
 Preferences preferences;
 HX711 scale;
-WiFiManager wifiManager;
-WiFiClient espClient;
-WiFiClientSecure espClientSecure;
+AsyncWebServer server(Defaults::HTTP_PORT);
+AsyncDNSServer dnsServer;
+ESPAsync_WiFiManager wifiManager(&server, &dnsServer, Defaults::HOSTNAME);
+WiFiClient wifiClient;
+WiFiClientSecure wifiClientSecure;
 PubSubClient mqttClient;
-WebServerSecure httpsServer(Defaults::HTTPS_PORT);
 DeviceConfig config;
 Measurements current;
 uint32_t lastReadMs = 0;
 uint32_t lastMqttMs = 0;
-
-static const char HTTPS_CERT[] PROGMEM = R"EOF(
------BEGIN CERTIFICATE-----
-MIIDFTCCAf2gAwIBAgIUVf9BkRuR+wDicJAbBrgaDGfyBT4wDQYJKoZIhvcNAQEL
-BQAwGjEYMBYGA1UEAwwPZXNwMzItZ2xwLmxvY2FsMB4XDTI2MDMyMjE0Mjc0M1oX
-DTM2MDMxOTE0Mjc0M1owGjEYMBYGA1UEAwwPZXNwMzItZ2xwLmxvY2FsMIIBIjAN
-BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoXv888DZqONMDha1JNqjghfQdNMW
-LgY3mPneubRHLNlZ1keZZbj6yQNmdiKTzUhktKdlfUkkHsxVH4AO0c27/f61qwyM
-c+mlFnhROTA5lU8XaN9Tm/rKNEDJvrlKZOykwnc6NzPbTvaV+EHj6I//FqaIBffJ
-Wd7VcFqapD7RCfssDu/VxZdPtf0BYIPszMTQpfh5id+xtjZk4ujcSZXcmfGMwIKh
-k15wMCBfC7ZGu6Kmjq0JUHpNQWVD2uVPSXGYb5TuhHjnenIbMcp1vrvnUEMPWu22
-0eadZuj8we4OJP3vXjzk93dYjYN2fy4Ak5YakhNGiKYzkTyV5QhIfg3AeQIDAQAB
-o1MwUTAdBgNVHQ4EFgQUIqoipzVmZXOEuruZi4oRFKOWKKIwHwYDVR0jBBgwFoAU
-IqoipzVmZXOEuruZi4oRFKOWKKIwDwYDVR0TAQH/BAUwAwEB/zANBgkqhkiG9w0B
-AQsFAAOCAQEAkLqgzUsde+ITZnr3Xl0FQ8BoXUL9JpSZu+q0kPa/iyD+dC8mzqCm
-Jtb+Ce+4/AF6q5orXU6cdQC+k/AivA+SiCqVEASzf0Pfs7IccAoals0cQJ1qjOgz
-bs9crNrcOud5hMX+TAuLIwZAggX0IsbK1M1ILZv3mXXwcDxpF/24e5SDIDrzb1K+
-thb7rczFWmOGf1+S4FsZii6+RdZQDoIEa6KSW2HbKUcMc1/1mBza7eWeHBAjJQLP
-nG0h3hAJ2YoT4zBYKRDPmJDNZqIwHVr58Jhju54gzc0Tasgend9FgoHB87SfMnsV
-IIxkyY5JABll3c8+aeoevp9huhT5FDtUiA==
------END CERTIFICATE-----
-)EOF";
-
-static const char HTTPS_KEY[] PROGMEM = R"EOF(
------BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQChe/zzwNmo40wO
-FrUk2qOCF9B00xYuBjeY+d65tEcs2VnWR5lluPrJA2Z2IpPNSGS0p2V9SSQezFUf
-gA7Rzbv9/rWrDIxz6aUWeFE5MDmVTxdo31Ob+so0QMm+uUpk7KTCdzo3M9tO9pX4
-QePoj/8WpogF98lZ3tVwWpqkPtEJ+ywO79XFl0+1/QFgg+zMxNCl+HmJ37G2NmTi
-6NxJldyZ8YzAgqGTXnAwIF8Ltka7oqaOrQlQek1BZUPa5U9JcZhvlO6EeOd6chsx
-ynW+u+dQQw9a7bbR5p1m6PzB7g4k/e9ePOT3d1iNg3Z/LgCTlhqSE0aIpjORPJXl
-CEh+DcB5AgMBAAECggEAEeatvtO1DTzNNI6d3A0ErSo4qIqx3b5AsYuZfhqW/UjG
-5bMgNR+RZXEkDZp9qfcJeuFHpeDSyTs7gHdwrR9SZLC0sNZ+R2cyLtB9qIpJB90x
-qiV/nj3p5mr8MlFWBuQYy5nt8SqleBZrv46GVkSIMZmaYJb8UiMapA7XL7fq8mEh
-ZUZGT97SYfJkIrEjbDisFALYqj1MhtWa//Nb2IeMPTEI5mXnkDMrUv+KaoY1ZIus
-ELEs0vPn4QQyses5LUq1F5EBWH2M6tSX167bzTn7IcwNdId6SuSZ2A0R/nP0RFw+
-HmbHv87XMEYDlYSHm3EaYd6Lw93NeK5Qs1ON15KmAQKBgQDbvCObmkCL9DmuCI2I
-w4jO4Cz61QimO/76+vf8Zm7YhgTRHuM6eHfbIVvFu3mTlNPlcAXKKRFJdIqOM5uY
-i/3pZF3tyr6SPL04+0Pz/j+AMD0fcPwjPeC4bAFsDccfVOWDkmhVGzDCYfk67Gd/
-dzxHu0tkz739qtO0GI3e0L0VOQKBgQC8Ir7aAE8uAYP3OuHF16/tc6i6HRvfLeMz
-ufqJayexj5k3i9FM4n64E+raJeUaOtH5haTVFbH/XPAAz5E1DFE+RjvwbadlZs+I
-4FhdLCTcQxz5OzQcbWgTQlV4H/H7GYMjbllU0Se3/nbSZ/U5i2Tt+Qi7Q4LbE3xj
-321MbOtFQQKBgAM3IpJBVJZ3sWxhhaitq8/TKfVVrrW4BQgpKf3Qhei3NVTWDd8q
-Kh7TwyMGlkXZlKwz0nHd3fnkMa7ZBHrb+ZAzvsgfAmDjcKVnz9u/KbC3g/10ysu9
-OQ+ZzP+GyBYmSOF+//XW2wTNKDd7hBwyY3htPjIwdAhFOqnU/iZ3iXzJAoGAclnE
-Gwk5F0OAjJLTi8cPfYphMc5jlIF1qYkPCNuCouAfRq3LJ6o7T3N7ueByokDCQ6HB
-kGrBZ+97SWLgZZf5AZr676YWqwGUfyOtUeR0+xQn1izv/Z9aNOqKvJreH7tgA/cc
-gPsn4yPd4QGjAbkCPcqyTfA45yOu5Z1194/0aIECgYAmtQ9GTh3+rpZXAW14FxN6
-CMQypo9LPoBS43IpfnE0TUqYKVrl6C7HwP6/VIyG5Lu8Tqi+c88eaSp6D5MFQODI
-Oyoq2NOP9HdqVsMdo0U/I/GVjOshvGMXEffiVGFisFyTc4W2ifFF3hI3qsTyoLEg
-+X8P1qP3LMI1NjK3xPIRtg==
------END PRIVATE KEY-----
-)EOF";
 
 String htmlEscape(const String& input) {
   String out;
@@ -144,6 +93,16 @@ String htmlEscape(const String& input) {
     }
   }
   return out;
+}
+
+String requestValue(AsyncWebServerRequest* request, const char* name) {
+  if (request->hasParam(name, true)) {
+    return request->getParam(name, true)->value();
+  }
+  if (request->hasParam(name)) {
+    return request->getParam(name)->value();
+  }
+  return String();
 }
 
 void saveConfig() {
@@ -162,7 +121,9 @@ void loadConfig() {
 
 float readTemperatureC() {
   int adc = analogRead(Pins::THERMISTOR_ADC);
-  if (adc <= 0 || adc >= Defaults::ADC_MAX) return NAN;
+  if (adc <= 0 || adc >= Defaults::ADC_MAX) {
+    return NAN;
+  }
 
   float resistance = config.seriesResistor / ((static_cast<float>(Defaults::ADC_MAX) / adc) - 1.0f);
   float steinhart = resistance / config.thermistorNominal;
@@ -182,7 +143,10 @@ void updateMeasurements() {
   current.grossKg = scale.get_units(10);
   current.tareKg = config.tareKg;
   current.netGlpKg = max(0.0f, current.grossKg - config.tareKg);
-  current.levelPct = constrain((current.netGlpKg / max(config.fullGlpKg, 0.1f)) * 100.0f, 0.0f, 100.0f);
+  current.levelPct = constrain(
+      (current.netGlpKg / max(config.fullGlpKg, 0.1f)) * 100.0f,
+      0.0f,
+      100.0f);
   current.estimatedLiters = current.netGlpKg / max(config.glpDensityKgL, 0.1f);
   current.temperatureC = readTemperatureC();
   current.valid = true;
@@ -191,7 +155,7 @@ void updateMeasurements() {
 String buildJson() {
   String json = "{";
   json += "\"deviceId\":\"" + String(config.deviceId) + "\",";
-  json += "\"wifi\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
   json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   json += "\"grossKg\":" + String(current.grossKg, 3) + ",";
   json += "\"tareKg\":" + String(current.tareKg, 3) + ",";
@@ -207,22 +171,29 @@ String buildJson() {
 
 String buildPage() {
   String page;
-  page.reserve(5000);
+  page.reserve(5500);
   page += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   page += F("<title>Balança GLP</title><style>body{font-family:Arial,sans-serif;margin:24px;background:#f4f7fb;color:#1e293b}"
             ".card{background:#fff;border-radius:16px;padding:20px;margin-bottom:18px;box-shadow:0 10px 25px rgba(15,23,42,.08)}"
-            "label{display:block;margin-top:12px;font-weight:600}input{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px}"
-            "button{margin-top:14px;padding:12px 18px;border:none;border-radius:10px;background:#2563eb;color:#fff;font-weight:700}"
-            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.metric{font-size:1.6rem;font-weight:700}</style></head><body>");
+            "label{display:block;margin-top:12px;font-weight:600}input,select{width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:10px}"
+            "button{margin-top:14px;padding:12px 18px;border:none;border-radius:10px;background:#2563eb;color:#fff;font-weight:700;cursor:pointer}"
+            ".grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px}.metric{font-size:1.6rem;font-weight:700}"
+            ".note{font-size:.95rem;color:#475569}</style></head><body>");
   page += F("<h1>Balança GLP ESP32</h1>");
   page += F("<div class='card'><h2>Status</h2><div class='grid'>");
   page += "<div><div class='metric'>" + String(current.grossKg, 2) + F(" kg</div><div>Massa total</div></div>");
   page += "<div><div class='metric'>" + String(current.netGlpKg, 2) + F(" kg</div><div>GLP líquido</div></div>");
   page += "<div><div class='metric'>" + String(current.levelPct, 1) + F(" %</div><div>Nível estimado</div></div>");
-  page += "<div><div class='metric'>" + String(current.temperatureC, 1) + F(" °C</div><div>Temperatura</div></div></div></div>");
-  page += F("<div class='card'><h2>Ações</h2><form method='POST' action='/tare'><button type='submit'>Gravar tara atual do recipiente</button></form>");
+  page += "<div><div class='metric'>" + String(current.estimatedLiters, 1) + F(" L</div><div>Volume estimado</div></div>");
+  page += "<div><div class='metric'>" + String(current.temperatureC, 1) + F(" °C</div><div>Temperatura</div></div>");
+  page += "<div><div class='metric'>" + WiFi.localIP().toString() + F("</div><div>IP local</div></div></div></div>");
+
+  page += F("<div class='card'><h2>Ações</h2>");
+  page += F("<form method='POST' action='/tare'><button type='submit'>Gravar tara atual do recipiente</button></form>");
   page += F("<form method='POST' action='/zero'><button type='submit'>Zerar plataforma vazia</button></form>");
-  page += F("<form method='POST' action='/restart'><button type='submit'>Reiniciar ESP32</button></form></div>");
+  page += F("<form method='POST' action='/restart'><button type='submit'>Reiniciar ESP32</button></form>");
+  page += F("<p class='note'>OTA permanece disponível via ArduinoOTA após a conexão na rede local.</p></div>");
+
   page += F("<div class='card'><h2>Parâmetros</h2><form method='POST' action='/config'>");
   page += "<label>Device ID</label><input name='deviceId' value='" + htmlEscape(String(config.deviceId)) + "'>";
   page += "<label>MQTT host</label><input name='mqttHost' value='" + htmlEscape(String(config.mqttHost)) + "'>";
@@ -230,134 +201,149 @@ String buildPage() {
   page += "<label>MQTT usuário</label><input name='mqttUser' value='" + htmlEscape(String(config.mqttUser)) + "'>";
   page += "<label>MQTT senha</label><input name='mqttPassword' type='password' value='" + htmlEscape(String(config.mqttPassword)) + "'>";
   page += "<label>Tópico MQTT</label><input name='mqttTopic' value='" + htmlEscape(String(config.mqttTopic)) + "'>";
+  page += "<label>MQTT com TLS</label><select name='mqttTls'>";
+  page += String(config.mqttTls ? "<option value='1' selected>Sim</option><option value='0'>Não</option>"
+                                : "<option value='1'>Sim</option><option value='0' selected>Não</option>");
+  page += "</select>";
   page += "<label>Fator de calibração HX711</label><input name='scaleFactor' value='" + String(config.scaleFactor, 3) + "'>";
   page += "<label>Tara do recipiente (kg)</label><input name='tareKg' value='" + String(config.tareKg, 3) + "'>";
   page += "<label>Capacidade útil GLP (kg)</label><input name='fullGlpKg' value='" + String(config.fullGlpKg, 3) + "'>";
   page += "<label>Densidade GLP (kg/L)</label><input name='glpDensityKgL' value='" + String(config.glpDensityKgL, 3) + "'>";
   page += "<label>Resistor série termistor (ohms)</label><input name='seriesResistor' value='" + String(config.seriesResistor, 1) + "'>";
+  page += "<label>Resistência nominal termistor (ohms)</label><input name='thermistorNominal' value='" + String(config.thermistorNominal, 1) + "'>";
+  page += "<label>Temperatura nominal do termistor (°C)</label><input name='temperatureNominal' value='" + String(config.temperatureNominal, 1) + "'>";
   page += "<label>Beta termistor</label><input name='betaCoefficient' value='" + String(config.betaCoefficient, 1) + "'>";
   page += F("<button type='submit'>Salvar parâmetros</button></form></div>");
-  page += F("<div class='card'><h2>API</h2><p>JSON em <code>/api/status</code> e OTA pelo Arduino IDE/PlatformIO com o hostname configurado.</p>");
-  page += F("<p><strong>Atenção:</strong> o HTTPS usa certificado autoassinado embutido; troque o certificado em produção.</p></div>");
+
+  page += F("<div class='card'><h2>Integração</h2>");
+  page += F("<p>JSON em <code>/api/status</code> e publicação MQTT em <code>&lt;topico-base&gt;/&lt;deviceId&gt;/state</code>.</p>");
+  page += F("<p class='note'>Este firmware foi migrado para <code>ESPAsyncWebServer</code>. Como essa pilha é focada em HTTP assíncrono, o acesso local está em HTTP. Se HTTPS for obrigatório, recomenda-se um proxy reverso/TLS gateway na rede.</p></div>");
   page += F("</body></html>");
   return page;
 }
 
-void handleRoot() { httpsServer.send(200, "text/html", buildPage()); }
-void handleStatusApi() { httpsServer.send(200, "application/json", buildJson()); }
+void redirectToRoot(AsyncWebServerRequest* request) {
+  request->redirect("/");
+}
 
-void handleConfigPost() {
-  auto copyArg = [](const char* name, char* dest, size_t size) {
-    String value = httpsServer.arg(name);
+void applyPostedConfig(AsyncWebServerRequest* request) {
+  auto copyField = [request](const char* name, char* target, size_t size) {
+    String value = requestValue(request, name);
     value.trim();
-    strlcpy(dest, value.c_str(), size);
+    if (value.length() > 0) {
+      strlcpy(target, value.c_str(), size);
+    }
   };
 
-  copyArg("deviceId", config.deviceId, sizeof(config.deviceId));
-  copyArg("mqttHost", config.mqttHost, sizeof(config.mqttHost));
-  copyArg("mqttUser", config.mqttUser, sizeof(config.mqttUser));
-  copyArg("mqttPassword", config.mqttPassword, sizeof(config.mqttPassword));
-  copyArg("mqttTopic", config.mqttTopic, sizeof(config.mqttTopic));
+  copyField("deviceId", config.deviceId, sizeof(config.deviceId));
+  copyField("mqttHost", config.mqttHost, sizeof(config.mqttHost));
+  copyField("mqttUser", config.mqttUser, sizeof(config.mqttUser));
+  copyField("mqttPassword", config.mqttPassword, sizeof(config.mqttPassword));
+  copyField("mqttTopic", config.mqttTopic, sizeof(config.mqttTopic));
 
-  config.mqttPort = httpsServer.arg("mqttPort").toInt();
-  config.scaleFactor = httpsServer.arg("scaleFactor").toFloat();
-  config.tareKg = httpsServer.arg("tareKg").toFloat();
-  config.fullGlpKg = httpsServer.arg("fullGlpKg").toFloat();
-  config.glpDensityKgL = httpsServer.arg("glpDensityKgL").toFloat();
-  config.seriesResistor = httpsServer.arg("seriesResistor").toFloat();
-  config.betaCoefficient = httpsServer.arg("betaCoefficient").toFloat();
+  config.mqttPort = max(1, requestValue(request, "mqttPort").toInt());
+  config.mqttTls = requestValue(request, "mqttTls") != "0";
+  config.scaleFactor = requestValue(request, "scaleFactor").toFloat();
+  config.tareKg = requestValue(request, "tareKg").toFloat();
+  config.fullGlpKg = max(0.1f, requestValue(request, "fullGlpKg").toFloat());
+  config.glpDensityKgL = max(0.1f, requestValue(request, "glpDensityKgL").toFloat());
+  config.seriesResistor = max(1.0f, requestValue(request, "seriesResistor").toFloat());
+  config.thermistorNominal = max(1.0f, requestValue(request, "thermistorNominal").toFloat());
+  config.temperatureNominal = requestValue(request, "temperatureNominal").toFloat();
+  config.betaCoefficient = max(1.0f, requestValue(request, "betaCoefficient").toFloat());
 
   saveConfig();
   scale.set_scale(config.scaleFactor);
-  httpsServer.sendHeader("Location", "/");
-  httpsServer.send(303, "text/plain", "Salvo");
+  scale.set_offset(config.hxOffset);
+  mqttClient.setServer(config.mqttHost, config.mqttPort);
 }
 
-void handleTare() {
-  updateMeasurements();
-  config.tareKg = current.grossKg;
-  saveConfig();
-  httpsServer.sendHeader("Location", "/");
-  httpsServer.send(303, "text/plain", "Tara atualizada");
-}
+void configureServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    updateMeasurements();
+    request->send(200, "text/html; charset=utf-8", buildPage());
+  });
 
-void handleZero() {
-  if (scale.wait_ready_timeout(3000)) {
-    config.hxOffset = scale.read_average(20);
-    scale.set_offset(config.hxOffset);
-    saveConfig();
-  }
-  httpsServer.sendHeader("Location", "/");
-  httpsServer.send(303, "text/plain", "Offset atualizado");
-}
+  server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    updateMeasurements();
+    request->send(200, "application/json", buildJson());
+  });
 
-void handleRestart() {
-  httpsServer.send(200, "text/plain", "Reiniciando...");
-  delay(500);
-  ESP.restart();
-}
+  server.on("/config", HTTP_POST, [](AsyncWebServerRequest* request) {
+    applyPostedConfig(request);
+    redirectToRoot(request);
+  });
 
-void configureHttpsServer() {
-  httpsServer.getServer().setRSACert(new BearSSL::X509List(HTTPS_CERT), new BearSSL::PrivateKey(HTTPS_KEY));
-  httpsServer.on("/", HTTP_GET, handleRoot);
-  httpsServer.on("/api/status", HTTP_GET, handleStatusApi);
-  httpsServer.on("/config", HTTP_POST, handleConfigPost);
-  httpsServer.on("/tare", HTTP_POST, handleTare);
-  httpsServer.on("/zero", HTTP_POST, handleZero);
-  httpsServer.on("/restart", HTTP_POST, handleRestart);
-  httpsServer.begin();
+  server.on("/tare", HTTP_POST, [](AsyncWebServerRequest* request) {
+    updateMeasurements();
+    if (current.valid) {
+      config.tareKg = current.grossKg;
+      saveConfig();
+    }
+    redirectToRoot(request);
+  });
+
+  server.on("/zero", HTTP_POST, [](AsyncWebServerRequest* request) {
+    if (scale.wait_ready_timeout(3000)) {
+      config.hxOffset = scale.read_average(20);
+      scale.set_offset(config.hxOffset);
+      saveConfig();
+    }
+    redirectToRoot(request);
+  });
+
+  server.on("/restart", HTTP_POST, [](AsyncWebServerRequest* request) {
+    request->send(200, "text/plain", "Reiniciando...");
+    delay(250);
+    ESP.restart();
+  });
+
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    request->send(404, "application/json", "{\"error\":\"not_found\"}");
+  });
+
+  DefaultHeaders::Instance().addHeader("Cache-Control", "no-store");
+  server.begin();
 }
 
 void setupWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(Defaults::HOSTNAME);
-
-  WiFiManagerParameter mqttHost("mqtt_host", "MQTT host", config.mqttHost, sizeof(config.mqttHost));
-  char mqttPortBuffer[8];
-  snprintf(mqttPortBuffer, sizeof(mqttPortBuffer), "%u", config.mqttPort);
-  WiFiManagerParameter mqttPort("mqtt_port", "MQTT port", mqttPortBuffer, sizeof(mqttPortBuffer));
-  WiFiManagerParameter mqttUser("mqtt_user", "MQTT user", config.mqttUser, sizeof(config.mqttUser));
-  WiFiManagerParameter mqttPass("mqtt_pass", "MQTT password", config.mqttPassword, sizeof(config.mqttPassword));
-  WiFiManagerParameter mqttTopic("mqtt_topic", "MQTT topic", config.mqttTopic, sizeof(config.mqttTopic));
-
   wifiManager.setConfigPortalTimeout(180);
-  wifiManager.addParameter(&mqttHost);
-  wifiManager.addParameter(&mqttPort);
-  wifiManager.addParameter(&mqttUser);
-  wifiManager.addParameter(&mqttPass);
-  wifiManager.addParameter(&mqttTopic);
-
   if (!wifiManager.autoConnect(Defaults::AP_NAME, Defaults::AP_PASSWORD)) {
     ESP.restart();
   }
-
-  strlcpy(config.mqttHost, mqttHost.getValue(), sizeof(config.mqttHost));
-  strlcpy(config.mqttUser, mqttUser.getValue(), sizeof(config.mqttUser));
-  strlcpy(config.mqttPassword, mqttPass.getValue(), sizeof(config.mqttPassword));
-  strlcpy(config.mqttTopic, mqttTopic.getValue(), sizeof(config.mqttTopic));
-  config.mqttPort = atoi(mqttPort.getValue());
-  saveConfig();
 }
 
 void setupMqtt() {
   mqttClient.setBufferSize(1024);
   if (config.mqttTls) {
-    espClientSecure.setInsecure();
-    mqttClient.setClient(espClientSecure);
+    wifiClientSecure.setInsecure();
+    mqttClient.setClient(wifiClientSecure);
   } else {
-    mqttClient.setClient(espClient);
+    mqttClient.setClient(wifiClient);
   }
   mqttClient.setServer(config.mqttHost, config.mqttPort);
 }
 
 void reconnectMqtt() {
-  if (mqttClient.connected() || strlen(config.mqttHost) == 0) return;
-  String clientId = String(config.deviceId) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (mqttClient.connected() || strlen(config.mqttHost) == 0) {
+    return;
+  }
+
+  if (config.mqttTls) {
+    wifiClientSecure.setInsecure();
+  }
+
+  String clientId = String(config.deviceId) + "-" + String(static_cast<uint32_t>(ESP.getEfuseMac()), HEX);
   mqttClient.connect(clientId.c_str(), config.mqttUser, config.mqttPassword);
 }
 
 void publishMqtt() {
-  if (!mqttClient.connected()) return;
+  if (!mqttClient.connected() || !current.valid) {
+    return;
+  }
+
   String topic = String(config.mqttTopic) + "/" + String(config.deviceId) + "/state";
   String payload = buildJson();
   mqttClient.publish(topic.c_str(), payload.c_str(), true);
@@ -387,21 +373,20 @@ void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
   loadConfig();
-  setupWifi();
-  setupOta();
   setupScale();
+  setupWifi();
+  configureServer();
   setupMqtt();
-  configureHttpsServer();
+  setupOta();
   updateMeasurements();
 }
 
 void loop() {
   ArduinoOTA.handle();
-  httpsServer.handleClient();
   reconnectMqtt();
   mqttClient.loop();
 
-  uint32_t now = millis();
+  const uint32_t now = millis();
   if (now - lastReadMs >= Defaults::READ_INTERVAL_MS) {
     lastReadMs = now;
     updateMeasurements();

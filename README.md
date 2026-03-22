@@ -5,9 +5,9 @@ Projeto base em PlatformIO/Arduino para montar uma balança de GLP com:
 - ESP32;
 - célula de carga de 50 kg com HX711;
 - termistor NTC 10 k;
-- configuração inicial por captive portal;
+- captive portal para provisionamento inicial do Wi‑Fi;
 - atualização OTA via ArduinoOTA;
-- interface web local em HTTPS para tara e parametrização;
+- interface web local com `ESPAsyncWebServer` para tara e parametrização;
 - telemetria MQTT com métricas de massa e volume estimado de GLP.
 
 ## Hardware sugerido
@@ -44,36 +44,32 @@ O percentual de carga usa `fullGlpKg` como referência. O volume estimado usa de
 
 ## Configuração inicial
 
-Na primeira energização, ou após reset do Wi-Fi salvo, o dispositivo sobe um AP:
+Na primeira energização, ou após reset das credenciais, o dispositivo sobe um AP:
 
 - SSID: `GLP-Scale-Setup`
 - Senha: `glp12345`
 
-Ao conectar no AP, o WiFiManager abre um captive portal para configurar:
+Ao conectar no AP, o captive portal assíncrono permite configurar o Wi‑Fi da rede local. Depois disso, os parâmetros operacionais e MQTT podem ser ajustados pela interface web principal.
 
-- Wi-Fi local;
-- host/porta do broker MQTT;
-- usuário/senha MQTT;
-- tópico base MQTT.
-
-## Interface web HTTPS
+## Interface web local
 
 Depois de conectado à rede local, acesse:
 
 ```text
-https://<ip-do-esp32>/
+http://<ip-do-esp32>/
 ```
 
 Funções disponíveis:
 
-- visualizar massa total, massa líquida de GLP, nível estimado e temperatura;
+- visualizar massa total, massa líquida de GLP, nível estimado, volume estimado e temperatura;
 - gravar a tara atual do recipiente;
 - zerar a plataforma vazia para atualizar o offset do HX711;
 - editar fator de calibração do HX711;
 - ajustar tara, capacidade útil, densidade do GLP e parâmetros do termistor;
+- configurar broker MQTT, porta, credenciais, tópico base e uso de TLS;
 - reiniciar o equipamento.
 
-> Observação: o firmware usa um certificado **autoassinado** embutido. Em produção, substitua o certificado e a chave por credenciais próprias.
+> Observação: nesta revisão o servidor foi migrado para `ESPAsyncWebServer`. Como essa pilha opera em HTTP assíncrono, o acesso local ficou em HTTP. Se HTTPS local for obrigatório, a recomendação prática é colocar um gateway/reverse proxy TLS na rede ou migrar para uma pilha de servidor compatível com TLS embarcado.
 
 ## OTA
 
@@ -92,7 +88,7 @@ Exemplo de JSON:
 ```json
 {
   "deviceId": "balanca-glp-01",
-  "wifi": "192.168.1.50",
+  "ip": "192.168.1.50",
   "rssi": -58,
   "grossKg": 44.821,
   "tareKg": 32.000,
@@ -113,7 +109,7 @@ Isso fornece dados usuais para gestão operacional do GLP, como:
 - percentual estimado de carga;
 - volume estimado em litros;
 - temperatura local;
-- qualidade do sinal Wi-Fi;
+- qualidade do sinal Wi‑Fi;
 - disponibilidade do nó.
 
 ## Ajustes recomendados antes de produção
@@ -121,9 +117,9 @@ Isso fornece dados usuais para gestão operacional do GLP, como:
 1. **Zerar a plataforma vazia** pela interface para armazenar o `hxOffset` inicial do HX711.
 2. **Calibrar o HX711** com massa padrão conhecida e ajustar `scaleFactor`.
 3. **Validar a curva do termistor** conforme o componente real utilizado.
-4. **Substituir o certificado HTTPS** embutido por um certificado/chave do seu ambiente.
-5. **Definir autenticação forte** no broker MQTT e, se necessário, trocar `setInsecure()` por validação CA.
-6. **Proteger a mecânica** da balança para minimizar erro por vibração, vento e desalinhamento do butijão.
+4. **Definir autenticação forte** no broker MQTT e, se necessário, substituir `setInsecure()` por validação CA.
+5. **Proteger a mecânica** da balança para minimizar erro por vibração, vento e desalinhamento do butijão.
+6. **Se HTTPS local for mandatório**, usar um gateway TLS na rede industrial/comercial ou trocar a pilha de servidor.
 
 ## Build
 
